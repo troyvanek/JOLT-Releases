@@ -1,0 +1,333 @@
+name: Stage JOLT 0.7.7 album browser release
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/stage-jolt-0.7.7.yml]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  stage:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Build and draft the verified album browser wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          project=jukebox_touchscreen_desktop
+          previous=${project}-0.7.6-py3-none-any.whl
+          release=${project}-0.7.7-py3-none-any.whl
+          gh release download v0.7.6 --repo "$GITHUB_REPOSITORY" --pattern "$previous"
+          sha256sum -c <<<"ebf91688955d2b46ce92e0fa8acbcfb26e07e53b94225d2fb66e9dc4c4cc677f  $previous"
+          python3 -m venv .build-venv
+          .build-venv/bin/pip install wheel
+          .build-venv/bin/python -m wheel unpack "$previous"
+          (
+            cd "${project}-0.7.6"
+            git apply --no-index --whitespace=nowarn <<'JOLT_PATCH'
+          --- a/jukebox/app.py
+          +++ b/jukebox/app.py
+          @@ -14,7 +14,7 @@
+           from PySide6.QtMultimedia import QAudioBuffer, QAudioBufferOutput, QAudioFormat, QAudioOutput, QMediaPlayer
+           from PySide6.QtQml import QQmlApplicationEngine
+           
+          -from .artwork import album_art, artwork_url
+          +from .artwork import album_thumbnail, artwork_url, thumbnail_is_fresh, thumbnail_path
+           from .cast import CastOutput
+           from .catalog import catalog_path, read_catalog, write_catalog
+           from .display import inhibit_display_idle
+          @@ -25,6 +25,7 @@
+           
+           
+           class Jukebox(QObject):
+          +    THUMBNAIL_WORKERS = 4
+               libraryChanged = Signal()
+               restartRequested = Signal()
+               albumCoverReady = Signal(str, str)
+          @@ -83,9 +84,12 @@
+                   self._cast_artwork_timer.timeout.connect(self._load_cast_track)
+                   self._album_covers = OrderedDict()
+                   self._album_jobs = {}
+          -        self._album_worker = ThreadPoolExecutor(max_workers=2)
+          +        self._album_window = {}
+          +        cache_location = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.GenericCacheLocation)
+          +        self._thumbnail_directory = Path(cache_location) / "jolt" / "thumbnails-v1"
+          +        self._album_worker = ThreadPoolExecutor(max_workers=self.THUMBNAIL_WORKERS)
+                   self._album_timer = QTimer(self)
+          -        self._album_timer.setInterval(120)
+          +        self._album_timer.setInterval(40)
+                   self._album_timer.timeout.connect(self._finish_album_covers)
+                   self._tracks: list[Track] = []
+                   self._filtered: list[Track] = []
+          @@ -351,27 +355,54 @@
+                   if key in self._album_covers:
+                       self._album_covers.move_to_end(key)
+                       return self._album_covers[key]
+          -        if self._connecting_cached_server:
+          -            return ""
+          -        if key not in self._album_jobs and 0 <= index < len(self._filtered):
+          +        if 0 <= index < len(self._filtered):
+                       track = self._filtered[index]
+                       if str(track.path.parent) == key:
+          -                self._album_jobs[key] = self._album_worker.submit(album_art, track)
+          -                self._album_timer.start()
+          +                cached = thumbnail_path(self._thumbnail_directory, track)
+          +                if thumbnail_is_fresh(cached):
+          +                    return QUrl.fromLocalFile(str(cached)).toString()
+                   return ""
+          +
+          +    @Slot("QVariantList")
+          +    def prefetchAlbumCovers(self, indexes):
+          +        self._album_window = {}
+          +        for index in indexes:
+          +            if 0 <= index < len(self._filtered):
+          +                track = self._filtered[index]
+          +                self._album_window.setdefault(str(track.path.parent), track)
+          +        self._schedule_album_covers()
+          +
+          +    def _schedule_album_covers(self):
+          +        if self._connecting_cached_server:
+          +            return
+          +        for key, job in list(self._album_jobs.items()):
+          +            if key not in self._album_window and job.cancel():
+          +                del self._album_jobs[key]
+          +        for key, track in self._album_window.items():
+          +            if len(self._album_jobs) >= self.THUMBNAIL_WORKERS:
+          +                break
+          +            if key in self._album_covers or key in self._album_jobs:
+          +                continue
+          +            destination = thumbnail_path(self._thumbnail_directory, track)
+          +            if not thumbnail_is_fresh(destination):
+          +                self._album_jobs[key] = self._album_worker.submit(album_thumbnail, track, destination)
+          +        if self._album_jobs and not self._album_timer.isActive():
+          +            self._album_timer.start()
+           
+               def _finish_album_covers(self):
+                   for key, job in list(self._album_jobs.items()):
+                       if job.done():
+                           del self._album_jobs[key]
+                           try:
+          -                    cover = job.result()
+          +                    destination = job.result()
+          +                    cover = QUrl.fromLocalFile(str(destination)).toString() if destination else ""
+                           except Exception:
+                               cover = ""
+                           self._album_covers[key] = cover
+          -                if len(self._album_covers) > 12:
+          +                if len(self._album_covers) > 96:
+                               self._album_covers.popitem(last=False)
+                           self.albumCoverReady.emit(key, cover)
+          +        self._schedule_album_covers()
+                   if not self._album_jobs:
+                       self._album_timer.stop()
+           
+          --- a/jukebox/Main.qml
+          +++ b/jukebox/Main.qml
+          @@ -556,6 +556,20 @@
+                               function goToPage(target) {
+                                   firstAlbum = 4 * Math.max(0, Math.min(target, pageCount - 1))
+                               }
+          +                    function prefetchCovers() {
+          +                        const indexes = []
+          +                        for (let offset = 0; offset < 8; ++offset) {
+          +                            const album = albums[firstAlbum + offset]
+          +                            if (album)
+          +                                indexes.push(album.tracks[0].queueIndex)
+          +                        }
+          +                        for (let offset = 1; offset <= 4; ++offset) {
+          +                            const album = albums[firstAlbum - offset]
+          +                            if (album)
+          +                                indexes.push(album.tracks[0].queueIndex)
+          +                        }
+          +                        jukebox.prefetchAlbumCovers(indexes)
+          +                    }
+                               readonly property var letters: {
+                                   const positions = {}
+                                   for (let i = 0; i < albums.length; i++) {
+          @@ -565,7 +579,12 @@
+                                   }
+                                   return positions
+                               }
+          -                    onAlbumsChanged: firstAlbum = 0
+          +                    onAlbumsChanged: {
+          +                        firstAlbum = 0
+          +                        Qt.callLater(prefetchCovers)
+          +                    }
+          +                    onFirstAlbumChanged: Qt.callLater(prefetchCovers)
+          +                    Component.onCompleted: Qt.callLater(prefetchCovers)
+           
+                               Item {
+                                   id: alphabetRail
+          @@ -822,7 +841,7 @@
+                                                   Layout.minimumHeight: 0
+                                                   spacing: 7
+                                                   Rectangle {
+          -                                            Layout.preferredWidth: Math.min(albumCard.width * 0.36, height)
+          +                                            Layout.preferredWidth: Math.min(albumCard.width * 0.31, height, 150)
+                                                       Layout.fillHeight: true
+                                                       Layout.minimumHeight: 0
+                                                       color: window.surfaceTone
+          @@ -840,7 +859,6 @@
+                                                           sourceSize: Qt.size(220, 220)
+                                                           fillMode: Image.PreserveAspectFit
+                                                           asynchronous: true
+          -                                                cache: false
+                                                       }
+                                                   }
+                                                   ListView {
+          @@ -853,7 +871,9 @@
+                                                       delegate: ItemDelegate {
+                                                           required property var modelData
+                                                           width: ListView.view.width
+          -                                                height: 52
+          +                                                height: Math.max(52, trackLabel.implicitHeight + topPadding + bottomPadding)
+          +                                                leftPadding: 7
+          +                                                rightPadding: 14
+                                                           enabled: !jukebox.scanning
+                                                           Accessible.name: "Select " + modelData.title
+                                                           onClicked: {
+          @@ -863,11 +883,12 @@
+                                                               trackConfirm.open()
+                                                           }
+                                                           contentItem: Label {
+          +                                                    id: trackLabel
+                                                               text: modelData.title
+                                                               textFormat: Text.PlainText
+                                                               font.pixelSize: 17
+                                                               color: window.actionAccent
+          -                                                    elide: Text.ElideRight
+          +                                                    wrapMode: Text.Wrap
+                                                               verticalAlignment: Text.AlignVCenter
+                                                           }
+                                                       }
+          --- a/jukebox/artwork.py
+          +++ b/jukebox/artwork.py
+          @@ -1,12 +1,18 @@
+           from base64 import b64decode, b64encode
+          +from hashlib import sha256
+           from pathlib import Path
+          +from time import time
+           
+           import mutagen
+           import smbclient
+           from mutagen.flac import Picture
+          +from PySide6.QtCore import QByteArray, QBuffer, QIODevice, QSaveFile, QSize, Qt
+          +from PySide6.QtGui import QImageReader
+           
+           MAX_ART_BYTES = 8 * 1024 * 1024
+           COVER_NAMES = ("cover.jpg", "folder.jpg", "front.jpg", "cover.png", "folder.png")
+          +THUMBNAIL_SIZE = 224
+          +THUMBNAIL_MAX_AGE = 7 * 24 * 60 * 60
+           
+           
+           def artwork_url(audio_path, track):
+          @@ -16,15 +22,51 @@
+               return image_url(image)
+           
+           
+          -def album_art(track):
+          -    image = folder_art(track)
+          +def thumbnail_path(directory, track):
+          +    cache_key = f"{track.server_username or ''}\0{track.path.parent}"
+          +    return directory / f"{sha256(cache_key.encode()).hexdigest()}.jpg"
+          +
+          +
+          +def thumbnail_is_fresh(path):
+          +    try:
+          +        return time() - path.stat().st_mtime < THUMBNAIL_MAX_AGE
+          +    except OSError:
+          +        return False
+          +
+          +
+          +def album_thumbnail(track, destination):
+          +    if thumbnail_is_fresh(destination):
+          +        return destination
+          +    image = folder_art(track, list_server_directory=True)
+               if not image:
+                   if isinstance(track.path, Path):
+                       image = embedded_art(track.path)
+                   else:
+                       with smbclient.open_file(str(track.path), mode="rb", username=track.server_username) as audio:
+                           image = embedded_art(audio)
+          -    return image_url(image)
+          +    if not image or len(image) > MAX_ART_BYTES:
+          +        return None
+          +    source = QBuffer()
+          +    source.setData(QByteArray(image))
+          +    source.open(QIODevice.OpenModeFlag.ReadOnly)
+          +    reader = QImageReader(source)
+          +    reader.setAutoTransform(True)
+          +    size = reader.size()
+          +    if not size.isValid():
+          +        return None
+          +    if max(size.width(), size.height()) > THUMBNAIL_SIZE:
+          +        reader.setScaledSize(size.scaled(QSize(THUMBNAIL_SIZE, THUMBNAIL_SIZE),
+          +                                        Qt.AspectRatioMode.KeepAspectRatio))
+          +    thumbnail = reader.read()
+          +    if thumbnail.isNull():
+          +        return None
+          +    destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+          +    output = QSaveFile(str(destination))
+          +    if output.open(QIODevice.OpenModeFlag.WriteOnly):
+          +        if thumbnail.save(output, "JPEG", 84) and output.commit():
+          +            return destination
+          +        output.cancelWriting()
+          +    return None
+           
+           
+           def image_url(image):
+          @@ -61,8 +103,16 @@
+               return b""
+           
+           
+          -def folder_art(track):
+          -    for name in COVER_NAMES:
+          +def folder_art(track, *, list_server_directory=False):
+          +    names = COVER_NAMES
+          +    if list_server_directory and not isinstance(track.path, Path):
+          +        try:
+          +            entries = smbclient.scandir(str(track.path.parent), username=track.server_username)
+          +            filenames = {entry.name.casefold(): entry.name for entry in entries}
+          +            names = [filenames[name] for name in COVER_NAMES if name in filenames]
+          +        except OSError:
+          +            pass
+          +    for name in names:
+                   cover = track.path.parent / name
+                   try:
+                       if isinstance(cover, Path):
+          
+          JOLT_PATCH
+            sha256sum -c <<'JOLT_HASHES'
+          a9350929f386ea5b1a55a186d8792ff2f9186df6b957e7f211336bb23ac9c19c  jukebox/app.py
+          2eedeff13731faf420c2ce4510bfb892c9cd6731483b6ac416e19fc8526ee3ee  jukebox/Main.qml
+          d92cdcf45be548ce0834b47d2d2791a831ef89dcd0643cba9205b45bf4be6208  jukebox/artwork.py
+          JOLT_HASHES
+            mv "${project}-0.7.6.dist-info" "${project}-0.7.7.dist-info"
+            cat > "${project}-0.7.7.dist-info/METADATA" <<'JOLT_METADATA'
+          Metadata-Version: 2.4
+          Name: jukebox-touchscreen-desktop
+          Version: 0.7.7
+          Summary: A touchscreen jukebox for Windows and Linux
+          Requires-Python: >=3.11
+          Requires-Dist: PySide6<7,>=6.8
+          Requires-Dist: smbprotocol<2,>=1.15
+          Requires-Dist: keyring<26,>=25
+          Requires-Dist: mutagen<2,>=1.47
+          Requires-Dist: jeepney>=0.9; sys_platform == "linux"
+          Requires-Dist: PyChromecast<15,>=14.1
+          JOLT_METADATA
+            grep -Fx 'Version: 0.7.7' "${project}-0.7.7.dist-info/METADATA"
+          )
+          .build-venv/bin/python -m wheel pack "${project}-0.7.6"
+          if gh release view v0.7.7 --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            printf '%s\n' 'JOLT 0.7.7 already has a release or draft. Inspect it before retrying.'
+            exit 1
+          fi
+          gh release create v0.7.7 "$release" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --draft --title 'JOLT 0.7.7' --notes-file - <<'JOLT_NOTES'
+          Long song titles wrap onto multiple lines in the album card. JOLT loads visible album covers first, preloads nearby covers, and caches thumbnails locally for faster return visits. Cold loads still read art from your music library.
+          
+          Install through Settings → Update JOLT.
+          JOLT_NOTES
