@@ -1,0 +1,764 @@
+name: Stage JOLT 0.7.5 Cast release
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/stage-jolt-0.7.5.yml]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  stage:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Build and draft the verified Cast wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          project=jukebox_touchscreen_desktop
+          previous=${project}-0.7.4-py3-none-any.whl
+          release=${project}-0.7.5-py3-none-any.whl
+          gh release download v0.7.4 --repo "$GITHUB_REPOSITORY" --pattern "$previous"
+          sha256sum -c <<<"b2e23b8ba1da6afec0fc13d1f6e61daec18ae6cbf65543e0dcaaafea1968439c  $previous"
+          python3 -m venv .build-venv
+          .build-venv/bin/pip install wheel
+          .build-venv/bin/python -m wheel unpack "$previous"
+          (
+            cd "${project}-0.7.4"
+            git apply --no-index --whitespace=nowarn <<'JOLT_PATCH'
+          --- a/jukebox/app.py
+          +++ b/jukebox/app.py
+          @@ -15,6 +15,7 @@
+           from PySide6.QtQml import QQmlApplicationEngine
+           
+           from .artwork import album_art, artwork_url
+          +from .cast import CastOutput
+           from .catalog import catalog_path, read_catalog, write_catalog
+           from .display import inhibit_display_idle
+           from .library import Track, scan_library
+          @@ -30,6 +31,7 @@
+               queueChanged = Signal()
+               playbackChanged = Signal()
+               timelineChanged = Signal()
+          +    volumeChanged = Signal()
+               statusChanged = Signal()
+               colorSchemeChanged = Signal()
+               navigationActivity = Signal()
+          @@ -97,6 +99,7 @@
+                   self._timer.timeout.connect(self._finish_scan)
+                   self._audio = QAudioOutput(self)
+                   self._audio.setVolume(0.65)
+          +        self._audio.volumeChanged.connect(self.volumeChanged)
+                   self._player = QMediaPlayer(self)
+                   self._player.setAudioOutput(self._audio)
+                   self._audio_levels = [0.0] * 24
+          @@ -112,6 +115,13 @@
+                   self._player.seekableChanged.connect(self.timelineChanged)
+                   self._player.mediaStatusChanged.connect(self._media_status)
+                   self._player.errorOccurred.connect(self._playback_error)
+          +        self._cast = CastOutput(self)
+          +        self._cast.connected.connect(self._start_casting)
+          +        self._cast.finished.connect(self.nextTrack)
+          +        self._cast.failed.connect(self._cast_failed)
+          +        self._cast.playbackChanged.connect(self.playbackChanged)
+          +        self._cast.timelineChanged.connect(self.timelineChanged)
+          +        self._cast.volumeChanged.connect(self.volumeChanged)
+                   if self.hasFolder:
+                       cached = read_catalog(self._catalog_path())
+                       if cached is None:
+          @@ -287,6 +297,7 @@
+               def close(self):
+                   self.markMilkDropActive(False)
+                   self.save_restart_queue()
+          +        self._cast.close()
+                   self._timer.stop()
+                   self._player.stop()
+                   self._player.setSource(QUrl())
+          @@ -369,21 +380,62 @@
+               def currentFolder(self):
+                   return self._current.album if self._current else ""
+           
+          +    @Property(QObject, constant=True)
+          +    def cast(self):
+          +        return self._cast
+          +
+               @Property(bool, notify=playbackChanged)
+               def playing(self):
+          -        return self._player.isPlaying()
+          +        return self._cast.playing if self._cast.name else self._player.isPlaying()
+           
+               @Property(float, notify=timelineChanged)
+               def position(self):
+          -        return self._player.position()
+          +        return self._cast.position if self._cast.name else self._player.position()
+           
+               @Property(float, notify=timelineChanged)
+               def duration(self):
+          -        return self._player.duration()
+          +        return self._cast.duration if self._cast.name else self._player.duration()
+           
+               @Property(bool, notify=timelineChanged)
+               def seekable(self):
+          -        return self._player.isSeekable()
+          +        return self._cast.seekable if self._cast.name else self._player.isSeekable()
+          +
+          +    @Property(float, notify=volumeChanged)
+          +    def volume(self):
+          +        return self._cast.volume if self._cast.name else self._audio.volume()
+          +
+          +    def _current_path(self):
+          +        if self._current and not self._download:
+          +            if isinstance(self._current.path, PureWindowsPath):
+          +                return self._cached_track
+          +            return self._current.path
+          +        return None
+          +
+          +    def _start_casting(self):
+          +        if path := self._current_path():
+          +            position = self._player.position()
+          +            playing = self._player.isPlaying()
+          +            self._player.stop()
+          +            self._player.setSource(QUrl())
+          +            self._cast.load(path, self._current.title, position, playing)
+          +        self.volumeChanged.emit()
+          +
+          +    @Slot()
+          +    def stopCasting(self):
+          +        if not self._cast.name:
+          +            return
+          +        self._return_from_cast(self._cast.playing)
+          +
+          +    def _return_from_cast(self, playing):
+          +        position = self._cast.position
+          +        self._cast.release()
+          +        if path := self._current_path():
+          +            self._play_local(path, position, playing)
+          +        self.volumeChanged.emit()
+          +
+          +    def _cast_failed(self, message):
+          +        self._return_from_cast(self._cast.resume_after_error)
+          +        self._show_status(message)
+           
+               @Property(str, notify=colorSchemeChanged)
+               def colorScheme(self):
+          @@ -557,6 +609,7 @@
+                       return
+                   self._player.stop()
+                   self._player.setSource(QUrl())
+          +        self._cast.clear_track()
+                   self._discard_download()
+                   if self._artwork_job:
+                       self._artwork_job.cancel()
+          @@ -575,10 +628,19 @@
+                   self.playbackChanged.emit()
+           
+               def _play_path(self, path):
+          -        self._player.setSource(QUrl.fromLocalFile(str(path)))
+          -        self._player.play()
+          +        if self._cast.name:
+          +            self._cast.load(path, self._current.title)
+          +        else:
+          +            self._play_local(path)
+                   self._artwork_job = self._artwork_worker.submit(artwork_url, path, self._current)
+                   self._artwork_timer.start()
+          +
+          +    def _play_local(self, path, position=0, autoplay=True):
+          +        self._player.setSource(QUrl.fromLocalFile(str(path)))
+          +        if position:
+          +            self._player.setPosition(position)
+          +        if autoplay:
+          +            self._player.play()
+           
+               def _finish_artwork(self):
+                   if not self._artwork_job.done():
+          @@ -632,6 +694,9 @@
+               def toggle(self):
+                   if self._download:
+                       return
+          +        if self._cast.name and self._current:
+          +            self._cast.toggle()
+          +            return
+                   if self.playing:
+                       self._player.pause()
+                   elif self._current:
+          @@ -645,18 +710,26 @@
+               @Slot(float)
+               def seek(self, fraction):
+                   if self.seekable:
+          -            self._player.setPosition(int(self.duration * max(0.0, min(fraction, 1.0))))
+          +            position = int(self.duration * max(0.0, min(fraction, 1.0)))
+          +            if self._cast.name:
+          +                self._cast.seek(position)
+          +            else:
+          +                self._player.setPosition(position)
+           
+               @Slot(float)
+               def setVolume(self, volume):
+          -        self._audio.setVolume(max(0.0, min(volume, 1.0)))
+          +        volume = max(0.0, min(volume, 1.0))
+          +        if self._cast.name:
+          +            self._cast.set_volume(volume)
+          +        else:
+          +            self._audio.setVolume(volume)
+           
+               def _media_status(self, status):
+                   if status == QMediaPlayer.MediaStatus.EndOfMedia:
+                       QTimer.singleShot(0, self, self._advance_at_end)
+           
+               def _advance_at_end(self):
+          -        if self._player.mediaStatus() == QMediaPlayer.MediaStatus.EndOfMedia:
+          +        if not self._cast.name and self._player.mediaStatus() == QMediaPlayer.MediaStatus.EndOfMedia:
+                       self.nextTrack()
+           
+               def _playback_error(self, _error, message):
+          --- a/jukebox/Main.qml
+          +++ b/jukebox/Main.qml
+          @@ -66,6 +66,7 @@
+           
+               readonly property var visualSettings: jukebox.visualizerSettings
+               readonly property bool visualizationAllowed: active && jukebox.playing && visualSettings.mode !== "off"
+          +        && !jukebox.cast.name && !castDialog.visible
+                   && !folderDialog.visible && !serverDialog.visible
+                   && !trackConfirm.visible && !settingsMenu.visible && !visualizerSettingsDialog.visible
+               onVisualizationAllowedChanged: {
+          @@ -126,6 +127,55 @@
+                       text: pageArrow.upward ? "▲" : "▼"
+                       color: window.accent
+                       font.pixelSize: 26
+          +        }
+          +    }
+          +
+          +    Dialog {
+          +        id: castDialog
+          +        objectName: "castDialog"
+          +        title: "Cast"
+          +        anchors.centerIn: parent
+          +        width: Math.min(window.width - 32, 480)
+          +        modal: true
+          +        standardButtons: Dialog.Close
+          +        onOpened: if (!jukebox.cast.name) jukebox.cast.scan()
+          +
+          +        contentItem: ColumnLayout {
+          +            spacing: 8
+          +            Label {
+          +                Layout.fillWidth: true
+          +                visible: text.length > 0
+          +                text: jukebox.cast.name ? "Casting to " + jukebox.cast.name : jukebox.cast.message
+          +                wrapMode: Text.WordWrap
+          +            }
+          +            ListView {
+          +                Layout.fillWidth: true
+          +                Layout.preferredHeight: Math.min(count, 4) * 54
+          +                visible: !jukebox.cast.name && count > 0
+          +                clip: true
+          +                model: jukebox.cast.devices
+          +                delegate: ItemDelegate {
+          +                    required property var modelData
+          +                    width: ListView.view.width
+          +                    height: 54
+          +                    text: modelData.name
+          +                    enabled: !jukebox.cast.busy
+          +                    onClicked: jukebox.cast.connectDevice(modelData.id)
+          +                }
+          +            }
+          +            Button {
+          +                text: jukebox.cast.name ? "Stop casting" : "Scan again"
+          +                enabled: !jukebox.cast.busy
+          +                implicitHeight: 48
+          +                onClicked: {
+          +                    if (jukebox.cast.name) {
+          +                        jukebox.stopCasting()
+          +                        castDialog.close()
+          +                    } else {
+          +                        jukebox.cast.scan()
+          +                    }
+          +                }
+          +            }
+                   }
+               }
+           
+          @@ -429,6 +479,10 @@
+                               MenuItem {
+                                   text: "Visualizer"
+                                   onTriggered: visualizerSettingsDialog.open()
+          +                    }
+          +                    MenuItem {
+          +                        text: jukebox.cast.name ? "Cast · " + jukebox.cast.name : "Cast…"
+          +                        onTriggered: castDialog.open()
+                               }
+                               MenuItem {
+                                   text: "Update JOLT"
+          @@ -915,10 +969,15 @@
+                                   Item { Layout.fillWidth: true }
+                                   Label { text: "Volume" }
+                                   Slider {
+          +                            id: volumeSlider
+                                       Layout.preferredWidth: window.compact ? 78 : 150
+                                       implicitHeight: 48
+                                       Accessible.name: "Volume"
+          -                            value: 0.65
+          +                            Binding on value {
+          +                                when: !volumeSlider.pressed
+          +                                value: jukebox.volume
+          +                                restoreMode: Binding.RestoreNone
+          +                            }
+                                       onMoved: jukebox.setVolume(value)
+                                   }
+                               }
+          --- /dev/null
+          +++ b/jukebox/cast.py
+          @@ -0,0 +1,419 @@
+          +import logging
+          +import re
+          +import secrets
+          +import socket
+          +from concurrent.futures import ThreadPoolExecutor
+          +from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+          +from pathlib import Path
+          +from threading import Thread
+          +from time import monotonic
+          +
+          +import pychromecast
+          +from PySide6.QtCore import QObject, Property, QTimer, Signal, Slot
+          +from pychromecast.response_handler import WaitResponse
+          +
+          +_AUDIO_TYPES = {
+          +    ".aac": "audio/aac",
+          +    ".flac": "audio/flac",
+          +    ".m4a": "audio/mp4",
+          +    ".mp3": "audio/mpeg",
+          +    ".ogg": "audio/ogg",
+          +    ".opus": "audio/ogg",
+          +    ".wav": "audio/wav",
+          +}
+          +_BYTE_RANGE = re.compile(r"bytes=(\d{0,20})-(\d{0,20})")
+          +
+          +
+          +class _TrackHandler(BaseHTTPRequestHandler):
+          +    def log_message(self, *_args):
+          +        pass
+          +
+          +    def do_HEAD(self):
+          +        self._send_track(head=True)
+          +
+          +    def do_GET(self):
+          +        self._send_track(head=False)
+          +
+          +    def do_OPTIONS(self):
+          +        track = self.server.track
+          +        if not track or self.path != track[0]:
+          +            self.send_error(404)
+          +            return
+          +        self.send_response(204)
+          +        self.send_header("Access-Control-Allow-Origin", "*")
+          +        self.send_header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
+          +        self.send_header("Access-Control-Allow-Headers", "Range")
+          +        self.send_header("Access-Control-Allow-Private-Network", "true")
+          +        self.end_headers()
+          +
+          +    def _send_track(self, head):
+          +        track = self.server.track
+          +        if not track or self.path != track[0]:
+          +            self.send_error(404)
+          +            return
+          +        _, path, mime = track
+          +        try:
+          +            source = path.open("rb")
+          +        except OSError:
+          +            self.send_error(404)
+          +            return
+          +        with source:
+          +            size = source.seek(0, 2)
+          +            start, end = 0, size - 1
+          +            range_header = self.headers.get("Range")
+          +            if range_header:
+          +                match = _BYTE_RANGE.fullmatch(range_header)
+          +                if match:
+          +                    first, last = match.groups()
+          +                    if first:
+          +                        start = int(first)
+          +                        end = min(end, int(last)) if last else end
+          +                    elif last:
+          +                        start = max(0, size - int(last))
+          +                    else:
+          +                        match = None
+          +                if not match or start > end:
+          +                    self.send_response(416)
+          +                    self.send_header("Content-Range", f"bytes */{size}")
+          +                    self.send_header("Content-Length", "0")
+          +                    self.end_headers()
+          +                    return
+          +            remaining = end - start + 1
+          +            self.send_response(206 if range_header else 200)
+          +            self.send_header("Content-Type", mime)
+          +            self.send_header("Content-Length", str(remaining))
+          +            self.send_header("Accept-Ranges", "bytes")
+          +            self.send_header("Access-Control-Allow-Origin", "*")
+          +            if range_header:
+          +                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+          +            self.end_headers()
+          +            if head:
+          +                return
+          +            source.seek(start)
+          +            try:
+          +                while remaining and (block := source.read(min(remaining, 64 * 1024))):
+          +                    self.wfile.write(block)
+          +                    remaining -= len(block)
+          +            except (BrokenPipeError, ConnectionResetError):
+          +                pass
+          +
+          +
+          +class _TrackServer(ThreadingHTTPServer):
+          +    def __init__(self, host):
+          +        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as route:
+          +            route.connect((host, 8009))
+          +            interface = route.getsockname()[0]
+          +        super().__init__((interface, 0), _TrackHandler)
+          +        self.track = None
+          +        Thread(target=self.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True).start()
+          +
+          +    def offer(self, path):
+          +        path = Path(path)
+          +        extension = path.suffix.lower()
+          +        mime = _AUDIO_TYPES[extension]
+          +        route = f"/{secrets.token_urlsafe(24)}{extension}"
+          +        self.track = (route, path, mime)
+          +        host, port = self.server_address
+          +        return f"http://{host}:{port}{route}", mime
+          +
+          +    def close(self):
+          +        self.track = None
+          +        self.shutdown()
+          +        self.server_close()
+          +
+          +
+          +def _discover():
+          +    devices, browser = pychromecast.discover_chromecasts(timeout=5)
+          +    try:
+          +        return sorted(devices, key=lambda device: (device.friendly_name or "").casefold())
+          +    finally:
+          +        browser.stop_discovery()
+          +
+          +
+          +def _connect(device):
+          +    address = (device.host, device.port, device.uuid, device.model_name, device.friendly_name)
+          +    cast = pychromecast.get_chromecast_from_host(address, tries=1, timeout=3)
+          +    try:
+          +        cast.wait(timeout=6)
+          +        return cast, _TrackServer(device.host)
+          +    except Exception:
+          +        _disconnect(cast, None, None)
+          +        raise
+          +
+          +
+          +def _stop_media(cast, url):
+          +    media = cast.media_controller
+          +    if url and media.status.content_id == url and media.status.player_state != "IDLE":
+          +        media.stop(timeout=2)
+          +
+          +
+          +def _load_media(cast, url, mime, title, position, autoplay):
+          +    response = WaitResponse(10, "Cast media load")
+          +    cast.media_controller.play_media(
+          +        url, mime, title=title, current_time=position / 1000,
+          +        autoplay=autoplay, stream_type="BUFFERED", callback_function=response.callback,
+          +    )
+          +    response.wait_response()
+          +
+          +
+          +def _disconnect(cast, server, url):
+          +    try:
+          +        _stop_media(cast, url)
+          +    except Exception:
+          +        logging.debug("Could not stop Cast playback", exc_info=True)
+          +    finally:
+          +        if server:
+          +            server.close()
+          +        try:
+          +            cast.disconnect(timeout=2)
+          +        except Exception:
+          +            logging.debug("Cast socket did not close immediately", exc_info=True)
+          +
+          +
+          +class CastOutput(QObject):
+          +    devicesChanged = Signal()
+          +    stateChanged = Signal()
+          +    playbackChanged = Signal()
+          +    timelineChanged = Signal()
+          +    volumeChanged = Signal()
+          +    connected = Signal()
+          +    finished = Signal()
+          +    failed = Signal(str)
+          +
+          +    def __init__(self, parent=None):
+          +        super().__init__(parent)
+          +        self._worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="JOLT Cast")
+          +        self._job = None
+          +        self._operation = ""
+          +        self._devices = []
+          +        self._cast = None
+          +        self._server = None
+          +        self._url = None
+          +        self._start_ms = 0
+          +        self._autoplay = False
+          +        self._deadline = 0
+          +        self._last_playing = False
+          +        self._last_volume = None
+          +        self._message = ""
+          +        self._commands = []
+          +        self._timer = QTimer(self, interval=200)
+          +        self._timer.timeout.connect(self._poll)
+          +        self._volume_timer = QTimer(self, singleShot=True, interval=180)
+          +        self._volume_timer.timeout.connect(self._send_volume)
+          +        self._requested_volume = 0.65
+          +        self._seek_timer = QTimer(self, singleShot=True, interval=180)
+          +        self._seek_timer.timeout.connect(self._send_seek)
+          +        self._requested_position = 0
+          +
+          +    @Property("QVariantList", notify=devicesChanged)
+          +    def devices(self):
+          +        return [
+          +            {"id": str(device.uuid), "name": device.friendly_name or "Cast device"}
+          +            for device in self._devices
+          +        ]
+          +
+          +    @Property(bool, notify=stateChanged)
+          +    def busy(self):
+          +        return self._job is not None
+          +
+          +    @Property(str, notify=stateChanged)
+          +    def name(self):
+          +        if self._cast:
+          +            return self._cast.cast_info.friendly_name or "Cast device"
+          +        return ""
+          +
+          +    @Property(str, notify=stateChanged)
+          +    def message(self):
+          +        return self._message
+          +
+          +    @Slot()
+          +    def scan(self):
+          +        if self.busy or self._cast:
+          +            return
+          +        self._devices = []
+          +        self.devicesChanged.emit()
+          +        self._start_job("scan", _discover, "Looking for Cast devices…")
+          +
+          +    @Slot(str)
+          +    def connectDevice(self, device_id):
+          +        if self.busy or self._cast:
+          +            return
+          +        for device in self._devices:
+          +            if str(device.uuid) == device_id:
+          +                self._start_job("connect", _connect, f"Connecting to {device.friendly_name or 'Cast device'}…", device)
+          +                return
+          +
+          +    def _start_job(self, operation, work, message, *args):
+          +        self._operation = operation
+          +        self._job = self._worker.submit(work, *args)
+          +        self._message = message
+          +        self.stateChanged.emit()
+          +        self._timer.start()
+          +
+          +    def _complete_job(self):
+          +        job, self._job = self._job, None
+          +        try:
+          +            result = job.result()
+          +        except Exception:
+          +            logging.debug("Cast %s failed", self._operation, exc_info=True)
+          +            self._message = (
+          +                "Could not find Cast devices. Check your network and try again."
+          +                if self._operation == "scan" else "Could not connect to the Cast device."
+          +            )
+          +        else:
+          +            if self._operation == "scan":
+          +                self._devices = result
+          +                self._message = "" if result else "No Cast devices found on this network."
+          +                self.devicesChanged.emit()
+          +            else:
+          +                self._cast, self._server = result
+          +                self._message = ""
+          +                self.connected.emit()
+          +        self.stateChanged.emit()
+          +
+          +    @property
+          +    def _status(self):
+          +        if self._cast and self._url:
+          +            status = self._cast.media_controller.status
+          +            if status.content_id == self._url:
+          +                return status
+          +        return None
+          +
+          +    @property
+          +    def playing(self):
+          +        status = self._status
+          +        return status.player_is_playing if status else bool(self._url and self._autoplay)
+          +
+          +    @property
+          +    def resume_after_error(self):
+          +        return self.playing or self._last_playing or bool(self._deadline and self._autoplay)
+          +
+          +    @property
+          +    def position(self):
+          +        status = self._status
+          +        return round((status.adjusted_current_time or 0) * 1000) if status else self._start_ms
+          +
+          +    @property
+          +    def duration(self):
+          +        status = self._status
+          +        return round((status.duration or 0) * 1000) if status else 0
+          +
+          +    @property
+          +    def seekable(self):
+          +        status = self._status
+          +        return bool(status and status.supports_seek)
+          +
+          +    @property
+          +    def volume(self):
+          +        status = self._cast.status if self._cast else None
+          +        return status.volume_level if status else self._requested_volume
+          +
+          +    def load(self, path, title, position=0, autoplay=True):
+          +        self._url, mime = self._server.offer(path)
+          +        self._start_ms = position
+          +        self._autoplay = autoplay
+          +        self._deadline = monotonic() + 20
+          +        self._commands.append(self._worker.submit(
+          +            _load_media, self._cast, self._url, mime, title, position, autoplay,
+          +        ))
+          +        self.playbackChanged.emit()
+          +        self.timelineChanged.emit()
+          +
+          +    def _poll(self):
+          +        if self._job and self._job.done():
+          +            self._complete_job()
+          +        for command in tuple(self._commands):
+          +            if command.done():
+          +                self._commands.remove(command)
+          +                if command.exception():
+          +                    self.failed.emit("The Cast device did not respond. Playing on this device.")
+          +                    break
+          +        if not self._cast:
+          +            if not self.busy:
+          +                self._timer.stop()
+          +            return
+          +        if not self._cast.socket_client.is_connected:
+          +            self.failed.emit("Cast connection lost. Playing on this device.")
+          +            return
+          +        status = self._status
+          +        if status and status.player_state == "IDLE" and status.idle_reason == "FINISHED":
+          +            self._url = None
+          +            self.finished.emit()
+          +        elif status and status.player_state == "IDLE" and status.idle_reason == "ERROR":
+          +            self.failed.emit("The Cast device could not play this track. Playing on this device.")
+          +        elif status and status.player_state == "IDLE" and status.idle_reason in ("CANCELLED", "INTERRUPTED"):
+          +            self.failed.emit("Cast playback stopped. JOLT switched back to this device.")
+          +        elif status and status.player_state in ("PLAYING", "PAUSED"):
+          +            self._deadline = 0
+          +        elif self._deadline and monotonic() >= self._deadline:
+          +            self.failed.emit("The Cast device did not start playback. Playing on this device.")
+          +        playing, volume = self.playing, self.volume
+          +        if playing != self._last_playing:
+          +            self._last_playing = playing
+          +            self.playbackChanged.emit()
+          +        if volume != self._last_volume:
+          +            self._last_volume = volume
+          +            self.volumeChanged.emit()
+          +        self.timelineChanged.emit()
+          +
+          +    def clear_track(self):
+          +        self._seek_timer.stop()
+          +        self._commands.clear()
+          +        if self._cast and self._url:
+          +            self._commands.append(self._worker.submit(_stop_media, self._cast, self._url))
+          +        if self._server:
+          +            self._server.track = None
+          +        self._url = None
+          +        self._deadline = 0
+          +        self._start_ms = 0
+          +
+          +    def toggle(self):
+          +        if self._status:
+          +            controller = self._cast.media_controller
+          +            method = controller.pause if self.playing else controller.play
+          +            self._commands.append(self._worker.submit(method, timeout=2))
+          +
+          +    def seek(self, position):
+          +        self._requested_position = position
+          +        self._seek_timer.start()
+          +
+          +    def _send_seek(self):
+          +        if self._status:
+          +            self._commands.append(self._worker.submit(
+          +                self._cast.media_controller.seek, self._requested_position / 1000, timeout=2,
+          +            ))
+          +
+          +    def set_volume(self, volume):
+          +        self._requested_volume = volume
+          +        self._volume_timer.start()
+          +
+          +    def _send_volume(self):
+          +        if self._cast:
+          +            self._commands.append(self._worker.submit(self._cast.set_volume, self._requested_volume, timeout=2))
+          +
+          +    def release(self):
+          +        if not self._cast:
+          +            return
+          +        self._volume_timer.stop()
+          +        self._seek_timer.stop()
+          +        self._server.track = None
+          +        self._worker.submit(_disconnect, self._cast, self._server, self._url)
+          +        self._cast = self._server = self._url = None
+          +        self._deadline = 0
+          +        self._start_ms = 0
+          +        self._commands.clear()
+          +        self.stateChanged.emit()
+          +        self.playbackChanged.emit()
+          +        self.timelineChanged.emit()
+          +
+          +    def close(self):
+          +        self._timer.stop()
+          +        self.release()
+          +        if self._job and self._operation == "connect":
+          +            self._job.add_done_callback(self._close_pending_connection)
+          +        self._worker.shutdown(wait=False)
+          +
+          +    @staticmethod
+          +    def _close_pending_connection(job):
+          +        if not job.cancelled() and job.exception() is None:
+          +            _disconnect(*job.result(), None)
+          
+          JOLT_PATCH
+            sha256sum -c <<'JOLT_HASHES'
+          ffc006356fcd2f44a87aa27b4a42a59090d39baa2c49cd85f38ba5e25c5b73cc  jukebox/app.py
+          52e123308bb464a5673b1434aca4cb87ff385cdec0b5029e39621fb81a886891  jukebox/Main.qml
+          5e7f76f9381ed17fc739e63b39e437339e6eb78e854a4405d55a3cde290aafbc  jukebox/cast.py
+          JOLT_HASHES
+            mv "${project}-0.7.4.dist-info" "${project}-0.7.5.dist-info"
+            cat > "${project}-0.7.5.dist-info/METADATA" <<'JOLT_METADATA'
+          Metadata-Version: 2.4
+          Name: jukebox-touchscreen-desktop
+          Version: 0.7.5
+          Summary: A touchscreen jukebox for Windows and Linux
+          Requires-Python: >=3.11
+          Requires-Dist: PySide6<7,>=6.8
+          Requires-Dist: smbprotocol<2,>=1.15
+          Requires-Dist: keyring<26,>=25
+          Requires-Dist: mutagen<2,>=1.47
+          Requires-Dist: jeepney>=0.9; sys_platform == "linux"
+          Requires-Dist: PyChromecast<15,>=14.1
+          JOLT_METADATA
+            grep -Fx 'Version: 0.7.5' "${project}-0.7.5.dist-info/METADATA"
+          )
+          .build-venv/bin/python -m wheel pack "${project}-0.7.4"
+          if gh release view v0.7.5 --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            printf '%s\n' 'JOLT 0.7.5 already has a release or draft. Inspect it before retrying.'
+            exit 1
+          fi
+          gh release create v0.7.5 "$release" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --draft --title 'JOLT 0.7.5' --notes-file - <<'JOLT_NOTES'
+          Adds Settings → Cast for Chromecast and other Google Cast devices on your local network. JOLT sends the current track and keeps the queue moving. Playback, seek, and device volume are controlled from JOLT.
+          
+          This build has passed simulated receiver tests. A test with real hardware is still pending.
+          JOLT_NOTES
