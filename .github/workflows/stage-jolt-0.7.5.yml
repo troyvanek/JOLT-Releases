@@ -752,9 +752,10 @@ jobs:
             grep -Fx 'Version: 0.7.5' "${project}-0.7.5.dist-info/METADATA"
           )
           .build-venv/bin/python -m wheel pack "${project}-0.7.4"
-          if gh release view v0.7.5 --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            printf '%s\n' 'JOLT 0.7.5 already has a release or draft. Inspect it before retrying.'
-            exit 1
+          if draft=$(gh release view v0.7.5 --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null); then
+            [[ "$draft" == true ]]
+            gh release upload v0.7.5 "$release" --repo "$GITHUB_REPOSITORY"
+            exit 0
           fi
           gh release create v0.7.5 "$release" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
             --draft --title 'JOLT 0.7.5' --notes-file - <<'JOLT_NOTES'
