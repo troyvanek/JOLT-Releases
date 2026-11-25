@@ -1,0 +1,363 @@
+name: Stage JOLT 0.7.6 Cast artwork release
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/stage-jolt-0.7.6.yml]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  stage:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Build and draft the verified Cast artwork wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          project=jukebox_touchscreen_desktop
+          previous=${project}-0.7.5-py3-none-any.whl
+          release=${project}-0.7.6-py3-none-any.whl
+          gh release download v0.7.5 --repo "$GITHUB_REPOSITORY" --pattern "$previous"
+          sha256sum -c <<<"3a93c1284f76a205f4e0c268c2037dd6a0a8d03e8e4ddb72513dd200fd6358ec  $previous"
+          python3 -m venv .build-venv
+          .build-venv/bin/pip install wheel
+          .build-venv/bin/python -m wheel unpack "$previous"
+          (
+            cd "${project}-0.7.5"
+            git apply --no-index --whitespace=nowarn <<'JOLT_PATCH'
+          --- a/jukebox/app.py
+          +++ b/jukebox/app.py
+          @@ -78,6 +78,9 @@
+                   self._artwork_timer = QTimer(self)
+                   self._artwork_timer.setInterval(100)
+                   self._artwork_timer.timeout.connect(self._finish_artwork)
+          +        self._pending_cast_track = None
+          +        self._cast_artwork_timer = QTimer(self, singleShot=True, interval=1200)
+          +        self._cast_artwork_timer.timeout.connect(self._load_cast_track)
+                   self._album_covers = OrderedDict()
+                   self._album_jobs = {}
+                   self._album_worker = ThreadPoolExecutor(max_workers=2)
+          @@ -121,6 +124,7 @@
+                   self._cast.failed.connect(self._cast_failed)
+                   self._cast.playbackChanged.connect(self.playbackChanged)
+                   self._cast.timelineChanged.connect(self.timelineChanged)
+          +        self._cast.timelineChanged.connect(self._sync_cast_visualizer)
+                   self._cast.volumeChanged.connect(self.volumeChanged)
+                   if self.hasFolder:
+                       cached = read_catalog(self._catalog_path())
+          @@ -192,6 +196,12 @@
+                       self.audioLevelsChanged.emit()
+                       self._waveform = ""
+                       self.waveformChanged.emit()
+          +        if self._cast.name:
+          +            if enabled:
+          +                self._sync_cast_visualizer()
+          +            else:
+          +                self._player.stop()
+          +                self._player.setSource(QUrl())
+           
+               def _reset_beat(self):
+                   self._beat_baseline = 0.01
+          @@ -297,6 +307,7 @@
+               def close(self):
+                   self.markMilkDropActive(False)
+                   self.save_restart_queue()
+          +        self._cancel_cast_track()
+                   self._cast.close()
+                   self._timer.stop()
+                   self._player.stop()
+          @@ -412,13 +423,50 @@
+                   return None
+           
+               def _start_casting(self):
+          +        self._player.setAudioOutput(None)
+                   if path := self._current_path():
+                       position = self._player.position()
+                       playing = self._player.isPlaying()
+                       self._player.stop()
+                       self._player.setSource(QUrl())
+          -            self._cast.load(path, self._current.title, position, playing)
+          +            self._prepare_cast_track(path, position, playing)
+                   self.volumeChanged.emit()
+          +
+          +    def _prepare_cast_track(self, path, position=0, autoplay=True):
+          +        self._pending_cast_track = (path, position, autoplay)
+          +        if self._artwork_job is None:
+          +            self._load_cast_track()
+          +        else:
+          +            self._cast_artwork_timer.start()
+          +
+          +    def _load_cast_track(self):
+          +        pending = self._pending_cast_track
+          +        self._cancel_cast_track()
+          +        if pending and self._cast.name and self._current:
+          +            path, position, autoplay = pending
+          +            self._cast.load(path, self._current.title, position, autoplay,
+          +                            album=self._current.album, artwork=self._artwork)
+          +
+          +    def _cancel_cast_track(self):
+          +        self._cast_artwork_timer.stop()
+          +        self._pending_cast_track = None
+          +
+          +    def _sync_cast_visualizer(self):
+          +        if not self._cast.name or not self._capture_visualization:
+          +            return
+          +        path = self._current_path()
+          +        if not path or not self._cast.playing or not self._cast.duration:
+          +            if self._player.isPlaying():
+          +                self._player.pause()
+          +            return
+          +        source = QUrl.fromLocalFile(str(path))
+          +        if self._player.source() != source:
+          +            self._player.setSource(source)
+          +        position = self._cast.position
+          +        if abs(position - self._player.position()) > 650:
+          +            self._player.setPosition(position)
+          +        if not self._player.isPlaying():
+          +            self._player.play()
+           
+               @Slot()
+               def stopCasting(self):
+          @@ -428,7 +476,13 @@
+           
+               def _return_from_cast(self, playing):
+                   position = self._cast.position
+          +        if self._pending_cast_track:
+          +            _, position, playing = self._pending_cast_track
+          +        self._cancel_cast_track()
+          +        self._player.stop()
+          +        self._player.setSource(QUrl())
+                   self._cast.release()
+          +        self._player.setAudioOutput(self._audio)
+                   if path := self._current_path():
+                       self._play_local(path, position, playing)
+                   self.volumeChanged.emit()
+          @@ -607,6 +661,7 @@
+               def nextTrack(self):
+                   if self.scanning and self._server:
+                       return
+          +        self._cancel_cast_track()
+                   self._player.stop()
+                   self._player.setSource(QUrl())
+                   self._cast.clear_track()
+          @@ -628,12 +683,12 @@
+                   self.playbackChanged.emit()
+           
+               def _play_path(self, path):
+          +        self._artwork_job = self._artwork_worker.submit(artwork_url, path, self._current)
+          +        self._artwork_timer.start()
+                   if self._cast.name:
+          -            self._cast.load(path, self._current.title)
+          +            self._prepare_cast_track(path)
+                   else:
+                       self._play_local(path)
+          -        self._artwork_job = self._artwork_worker.submit(artwork_url, path, self._current)
+          -        self._artwork_timer.start()
+           
+               def _play_local(self, path, position=0, autoplay=True):
+                   self._player.setSource(QUrl.fromLocalFile(str(path)))
+          @@ -651,6 +706,8 @@
+                       self._artwork = job.result()
+                   except Exception:
+                       self._artwork = ""
+          +        if self._pending_cast_track:
+          +            self._load_cast_track()
+                   self.playbackChanged.emit()
+           
+               def _finish_download(self):
+          @@ -733,7 +790,7 @@
+                       self.nextTrack()
+           
+               def _playback_error(self, _error, message):
+          -        if self._current:
+          +        if self._current and not self._cast.name:
+                       self._show_status(f"Could not play {self._current.title}. {message}")
+           
+           
+          --- a/jukebox/Main.qml
+          +++ b/jukebox/Main.qml
+          @@ -66,7 +66,7 @@
+           
+               readonly property var visualSettings: jukebox.visualizerSettings
+               readonly property bool visualizationAllowed: active && jukebox.playing && visualSettings.mode !== "off"
+          -        && !jukebox.cast.name && !castDialog.visible
+          +        && !castDialog.visible
+                   && !folderDialog.visible && !serverDialog.visible
+                   && !trackConfirm.visible && !settingsMenu.visible && !visualizerSettingsDialog.visible
+               onVisualizationAllowedChanged: {
+          @@ -139,6 +139,11 @@
+                   modal: true
+                   standardButtons: Dialog.Close
+                   onOpened: if (!jukebox.cast.name) jukebox.cast.scan()
+          +
+          +        Connections {
+          +            target: jukebox.cast
+          +            function onConnected() { castDialog.close() }
+          +        }
+           
+                   contentItem: ColumnLayout {
+                       spacing: 8
+          --- a/jukebox/cast.py
+          +++ b/jukebox/cast.py
+          @@ -2,8 +2,10 @@
+           import re
+           import secrets
+           import socket
+          +from base64 import b64decode
+           from concurrent.futures import ThreadPoolExecutor
+           from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+          +from io import BytesIO
+           from pathlib import Path
+           from threading import Thread
+           from time import monotonic
+          @@ -35,8 +37,7 @@
+                   self._send_track(head=False)
+           
+               def do_OPTIONS(self):
+          -        track = self.server.track
+          -        if not track or self.path != track[0]:
+          +        if self.path not in self.server.resources:
+                       self.send_error(404)
+                       return
+                   self.send_response(204)
+          @@ -47,13 +48,13 @@
+                   self.end_headers()
+           
+               def _send_track(self, head):
+          -        track = self.server.track
+          -        if not track or self.path != track[0]:
+          +        resource = self.server.resources.get(self.path)
+          +        if not resource:
+                       self.send_error(404)
+                       return
+          -        _, path, mime = track
+          +        payload, mime = resource
+                   try:
+          -            source = path.open("rb")
+          +            source = payload.open("rb") if isinstance(payload, Path) else BytesIO(payload)
+                   except OSError:
+                       self.send_error(404)
+                       return
+          @@ -104,20 +105,31 @@
+                       route.connect((host, 8009))
+                       interface = route.getsockname()[0]
+                   super().__init__((interface, 0), _TrackHandler)
+          -        self.track = None
+          +        self.resources = {}
+                   Thread(target=self.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True).start()
+           
+          -    def offer(self, path):
+          +    def offer(self, path, artwork):
+                   path = Path(path)
+                   extension = path.suffix.lower()
+                   mime = _AUDIO_TYPES[extension]
+          -        route = f"/{secrets.token_urlsafe(24)}{extension}"
+          -        self.track = (route, path, mime)
+          +        token = secrets.token_urlsafe(24)
+          +        route = f"/{token}{extension}"
+          +        resources = {route: (path, mime)}
+                   host, port = self.server_address
+          -        return f"http://{host}:{port}{route}", mime
+          +        base = f"http://{host}:{port}"
+          +        thumbnail = None
+          +        header, _, encoded = artwork.partition(",")
+          +        if header in ("data:image/jpeg;base64", "data:image/png;base64"):
+          +            image_type = header[5:].split(";")[0]
+          +            image_suffix = ".png" if image_type == "image/png" else ".jpg"
+          +            image_route = f"/{token}/cover{image_suffix}"
+          +            resources[image_route] = (b64decode(encoded), image_type)
+          +            thumbnail = f"{base}{image_route}"
+          +        self.resources = resources
+          +        return f"{base}{route}", mime, thumbnail
+           
+               def close(self):
+          -        self.track = None
+          +        self.resources = {}
+                   self.shutdown()
+                   self.server_close()
+           
+          @@ -147,10 +159,11 @@
+                   media.stop(timeout=2)
+           
+           
+          -def _load_media(cast, url, mime, title, position, autoplay):
+          +def _load_media(cast, url, mime, title, album, thumbnail, position, autoplay):
+               response = WaitResponse(10, "Cast media load")
+               cast.media_controller.play_media(
+          -        url, mime, title=title, current_time=position / 1000,
+          +        url, mime, title=title, thumb=thumbnail, current_time=position / 1000,
+          +        metadata={"metadataType": 3, "albumName": album},
+                   autoplay=autoplay, stream_type="BUFFERED", callback_function=response.callback,
+               )
+               response.wait_response()
+          @@ -308,13 +321,13 @@
+                   status = self._cast.status if self._cast else None
+                   return status.volume_level if status else self._requested_volume
+           
+          -    def load(self, path, title, position=0, autoplay=True):
+          -        self._url, mime = self._server.offer(path)
+          +    def load(self, path, title, position=0, autoplay=True, *, album="", artwork=""):
+          +        self._url, mime, thumbnail = self._server.offer(path, artwork)
+                   self._start_ms = position
+                   self._autoplay = autoplay
+                   self._deadline = monotonic() + 20
+                   self._commands.append(self._worker.submit(
+          -            _load_media, self._cast, self._url, mime, title, position, autoplay,
+          +            _load_media, self._cast, self._url, mime, title, album, thumbnail, position, autoplay,
+                   ))
+                   self.playbackChanged.emit()
+                   self.timelineChanged.emit()
+          @@ -362,7 +375,7 @@
+                   if self._cast and self._url:
+                       self._commands.append(self._worker.submit(_stop_media, self._cast, self._url))
+                   if self._server:
+          -            self._server.track = None
+          +            self._server.resources = {}
+                   self._url = None
+                   self._deadline = 0
+                   self._start_ms = 0
+          @@ -396,7 +409,7 @@
+                       return
+                   self._volume_timer.stop()
+                   self._seek_timer.stop()
+          -        self._server.track = None
+          +        self._server.resources = {}
+                   self._worker.submit(_disconnect, self._cast, self._server, self._url)
+                   self._cast = self._server = self._url = None
+                   self._deadline = 0
+          
+          JOLT_PATCH
+            sha256sum -c <<'JOLT_HASHES'
+          adcd60b9f4a47c82cc09eac6fef49f757a30dd92ee88ba53aa86de3e3bfb32ff  jukebox/app.py
+          0091337d3c19292f5d5508d6de3f3577a4e123063153c6f8fe27b45d07353f87  jukebox/Main.qml
+          8eb4d6be610f7ba912599b92a59d71e01b016ae999cde53cd1b1f6578f336b13  jukebox/cast.py
+          JOLT_HASHES
+            mv "${project}-0.7.5.dist-info" "${project}-0.7.6.dist-info"
+            cat > "${project}-0.7.6.dist-info/METADATA" <<'JOLT_METADATA'
+          Metadata-Version: 2.4
+          Name: jukebox-touchscreen-desktop
+          Version: 0.7.6
+          Summary: A touchscreen jukebox for Windows and Linux
+          Requires-Python: >=3.11
+          Requires-Dist: PySide6<7,>=6.8
+          Requires-Dist: smbprotocol<2,>=1.15
+          Requires-Dist: keyring<26,>=25
+          Requires-Dist: mutagen<2,>=1.47
+          Requires-Dist: jeepney>=0.9; sys_platform == "linux"
+          Requires-Dist: PyChromecast<15,>=14.1
+          JOLT_METADATA
+            grep -Fx 'Version: 0.7.6' "${project}-0.7.6.dist-info/METADATA"
+          )
+          .build-venv/bin/python -m wheel pack "${project}-0.7.5"
+          if gh release view v0.7.6 --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            printf '%s\n' 'JOLT 0.7.6 already has a release or draft. Inspect it before retrying.'
+            exit 1
+          fi
+          gh release create v0.7.6 "$release" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --draft --title 'JOLT 0.7.6' --notes-file - <<'JOLT_NOTES'
+          Shows the visualizer and album cover on the JOLT touchscreen while casting audio. Sends the album cover to the Cast device as now-playing artwork.
+          
+          Use Settings → Update JOLT to install this release. The cast artwork transfer and touchscreen playback were tested locally. The Shield display still needs a live test.
+          JOLT_NOTES
